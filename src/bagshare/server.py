@@ -7,26 +7,87 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
-from .protocol import BUFFER_SIZE, encode_file_id, safe_file, sha256_file
+from .protocol import BUFFER_SIZE, decode_file_id, encode_file_id, manifest_sha256, safe_file, sha256_file
 
 
 RANGE_RE = re.compile(r"bytes=(\d+)-(\d*)$")
+ROSBAG_DATA_SUFFIXES = {".db3", ".mcap"}
+
+
+def rosbag_files(root: Path, bag: Path) -> list[dict[str, object]]:
+    files: list[dict[str, object]] = []
+    paths = sorted(bag.rglob("*"), key=lambda item: item.relative_to(bag).as_posix().casefold())
+    for path in paths:
+        if not path.is_file() or path.is_symlink():
+            continue
+        stat = path.stat()
+        files.append(
+            {
+                "id": encode_file_id(path.relative_to(root).as_posix()),
+                "path": path.relative_to(bag).as_posix(),
+                "size": stat.st_size,
+                "modified_ns": stat.st_mtime_ns,
+            }
+        )
+    return files
+
+
+def is_rosbag_directory(path: Path) -> bool:
+    metadata = path / "metadata.yaml"
+    if not metadata.is_file() or metadata.is_symlink():
+        return False
+    return any(
+        item.is_file() and not item.is_symlink() and item.suffix.lower() in ROSBAG_DATA_SUFFIXES
+        for item in path.rglob("*")
+    )
+
+
+def build_manifest(root: Path, bag_id: str) -> dict[str, object]:
+    try:
+        bag = (root / decode_file_id(bag_id)).resolve()
+        bag.relative_to(root.resolve())
+    except (ValueError, UnicodeError) as exc:
+        raise FileNotFoundError(bag_id) from exc
+    if not bag.is_dir() or bag.is_symlink() or not is_rosbag_directory(bag):
+        raise FileNotFoundError(bag_id)
+    files = rosbag_files(root, bag)
+    return {
+        "id": bag_id,
+        "name": bag.name,
+        "type": "rosbag2",
+        "size": sum(int(item["size"]) for item in files),
+        "file_count": len(files),
+        "files": files,
+        "manifest_sha256": manifest_sha256(files),
+    }
 
 
 def list_files(root: Path) -> list[dict[str, object]]:
-    files = []
+    entries = []
     for path in sorted(root.iterdir(), key=lambda item: item.name.casefold()):
-        if path.is_file():
+        if path.is_file() and not path.is_symlink():
             stat = path.stat()
-            files.append(
+            entries.append(
                 {
                     "id": encode_file_id(path.name),
                     "name": path.name,
+                    "type": "file",
                     "size": stat.st_size,
                     "modified_ns": stat.st_mtime_ns,
                 }
             )
-    return files
+        elif path.is_dir() and not path.is_symlink() and is_rosbag_directory(path):
+            files = rosbag_files(root, path)
+            entries.append(
+                {
+                    "id": encode_file_id(path.name),
+                    "name": path.name,
+                    "type": "rosbag2",
+                    "size": sum(int(item["size"]) for item in files),
+                    "file_count": len(files),
+                }
+            )
+    return entries
 
 
 class BagShareServer(ThreadingHTTPServer):
@@ -49,6 +110,9 @@ class BagShareHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == "/v1/files":
             self._json({"files": list_files(self.server.root)})
+            return
+        if path.startswith("/v1/manifests/"):
+            self._manifest(unquote(path.removeprefix("/v1/manifests/")))
             return
         if path.startswith("/v1/hash/"):
             self._hash(unquote(path.removeprefix("/v1/hash/")))
@@ -84,6 +148,14 @@ class BagShareHandler(BaseHTTPRequestHandler):
         path = self._resolve(file_id)
         if path is not None:
             self._json({"sha256": sha256_file(path)})
+
+    def _manifest(self, bag_id: str) -> None:
+        try:
+            manifest = build_manifest(self.server.root, bag_id)
+        except FileNotFoundError:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        self._json(manifest)
 
     def _file(self, file_id: str, send_body: bool) -> None:
         path = self._resolve(file_id)
