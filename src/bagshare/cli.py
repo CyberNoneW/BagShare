@@ -8,7 +8,7 @@ import uuid
 from pathlib import Path
 
 from . import __version__
-from .client import download, get_files, human_size
+from .client import download, download_rosbag, get_files, human_size
 from .discovery import Announcer, Device, discover
 from .server import create_server
 
@@ -30,7 +30,7 @@ def parser() -> argparse.ArgumentParser:
     listing.add_argument("device")
     listing.add_argument("--timeout", type=float, default=3.0)
 
-    pull = sub.add_parser("pull", help="download a file, e.g. buzz-linux:2")
+    pull = sub.add_parser("pull", help="download a file or ROS 2 bag, e.g. buzz-linux:2")
     pull.add_argument("selector")
     pull.add_argument("--output", "-o", type=Path)
     pull.add_argument("--timeout", type=float, default=3.0)
@@ -53,7 +53,11 @@ def print_files(files: list[dict[str, object]]) -> None:
         return
     width = len(str(len(files)))
     for index, item in enumerate(files, 1):
-        print(f"{index:>{width}}  {str(item['name']):<40} {human_size(int(item['size'])):>10}")
+        if item.get("type") == "rosbag2":
+            kind = f"ROS 2 bag, {int(item['file_count'])} files"
+        else:
+            kind = "file"
+        print(f"{index:>{width}}  {str(item['name']):<40} {human_size(int(item['size'])):>10}  {kind}")
 
 
 def serve_command(args: argparse.Namespace) -> int:
@@ -111,10 +115,14 @@ def main(argv: list[str] | None = None) -> None:
             if destination.exists():
                 raise FileExistsError(f"destination already exists: {destination}")
             print(str(item["name"]))
-            path, verified = download(device, item, destination)
-            if not verified:
-                raise IOError(f"SHA-256 verification failed; partial file kept at {path}")
-            print(f"Saved to {path} (SHA-256 verified)")
+            if item.get("type") == "rosbag2":
+                path = download_rosbag(device, item, destination)
+                print(f"Saved ROS 2 bag to {path} (all files verified)")
+            else:
+                path, verified = download(device, item, destination)
+                if not verified:
+                    raise IOError(f"SHA-256 verification failed; partial file kept at {path}")
+                print(f"Saved to {path} (SHA-256 verified)")
             code = 0
         else:
             raise AssertionError(args.command)
@@ -122,4 +130,3 @@ def main(argv: list[str] | None = None) -> None:
         print(f"bagshare: error: {exc}", file=sys.stderr)
         code = 1
     raise SystemExit(code)
-

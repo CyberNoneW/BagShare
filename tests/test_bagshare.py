@@ -4,9 +4,9 @@ import threading
 import urllib.request
 from pathlib import Path
 
-from bagshare.client import download, get_files
+from bagshare.client import download, download_rosbag, get_files, get_manifest
 from bagshare.discovery import Device
-from bagshare.protocol import decode_file_id, encode_file_id, safe_file, sha256_file
+from bagshare.protocol import decode_file_id, encode_file_id, safe_file, safe_relative_destination, sha256_file
 from bagshare.server import create_server
 
 
@@ -32,6 +32,13 @@ def test_file_id_round_trip_and_path_safety(tmp_path: Path) -> None:
         pass
     else:
         raise AssertionError("path traversal should be rejected")
+
+    try:
+        safe_relative_destination(tmp_path, "../escape.db3")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("manifest path traversal should be rejected")
 
 
 def test_list_range_and_download_resume(tmp_path: Path) -> None:
@@ -64,6 +71,53 @@ def test_list_range_and_download_resume(tmp_path: Path) -> None:
         assert destination.read_bytes() == content
         assert sha256_file(destination) == sha256_file(source)
         assert not part.exists()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_rosbag_directory_manifest_and_resumable_download(tmp_path: Path) -> None:
+    shared = tmp_path / "shared"
+    bag = shared / "highway"
+    nested = bag / "segments"
+    nested.mkdir(parents=True)
+    metadata = b"rosbag2_bagfile_information:\n  version: 5\n"
+    first = b"db3-data-" * 100_000
+    (bag / "metadata.yaml").write_bytes(metadata)
+    (bag / "highway_0.db3").write_bytes(first)
+    (nested / "highway_1.mcap").write_bytes(b"")
+    ignored = shared / "ordinary-directory"
+    ignored.mkdir()
+    (ignored / "notes.txt").write_text("not a rosbag")
+
+    server, thread = running_server(shared)
+    device = Device("test", "sender", "127.0.0.1", server.server_port)
+    try:
+        entries = get_files(device)
+        assert [entry["name"] for entry in entries] == ["highway"]
+        item = entries[0]
+        assert item["type"] == "rosbag2"
+        assert item["file_count"] == 3
+
+        manifest = get_manifest(device, str(item["id"]))
+        assert [entry["path"] for entry in manifest["files"]] == [
+            "highway_0.db3",
+            "metadata.yaml",
+            "segments/highway_1.mcap",
+        ]
+
+        destination = tmp_path / "received" / "highway"
+        partial = tmp_path / "received" / ".highway.bagshare-part" / "highway_0.db3.part"
+        partial.parent.mkdir(parents=True)
+        partial.write_bytes(first[:12345])
+
+        result = download_rosbag(device, item, destination, progress=lambda *_: None)
+        assert result == destination
+        assert (destination / "metadata.yaml").read_bytes() == metadata
+        assert (destination / "highway_0.db3").read_bytes() == first
+        assert (destination / "segments" / "highway_1.mcap").read_bytes() == b""
+        assert not partial.parent.exists()
     finally:
         server.shutdown()
         server.server_close()
