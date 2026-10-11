@@ -14,21 +14,36 @@ python -m venv .venv
 source .venv/bin/activate       # Windows: .venv\Scripts\activate
 python -m pip install -e .
 ```
+## Prerequisite
+
+1. For Mac, need to deactivate firewall first.
 
 ## Use
 
 On the sending computer:
 
 ```bash
-bagshare serve ~/rosbags
+bagshare serve path/to/rosbag --name <sender-name> 
+# sender-name is buzz-linux by default
 ```
 
 On the receiving computer:
 
 ```bash
 bagshare discover
-bagshare list buzz-linux
-bagshare pull buzz-linux:2
+## Example output: 
+# 1. mac-sender  192.168.0.101:50925  id=2007294f84ff
+
+bagshare list <sender-name>
+## Example output: 
+# 1  test.mcap          256.0 MB
+# 2  recording.db3        4.3 GB
+# 3  highway.bag          8.7 GB
+
+bagshare pull <sender-name>:<file-id>
+## Example command: 
+# bagshare pull mac-sender:1
+
 ```
 
 Use `-o PATH` to choose the output path. An interrupted transfer remains as a
