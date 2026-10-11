@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Callable
 
 from .discovery import Device
-from .protocol import BUFFER_SIZE
+from .protocol import BUFFER_SIZE, manifest_sha256, safe_relative_destination, sha256_file
 
 
 def api_url(device: Device, path: str) -> str:
@@ -20,6 +20,11 @@ def get_files(device: Device, timeout: float = 10.0) -> list[dict[str, object]]:
     with urllib.request.urlopen(api_url(device, "/v1/files"), timeout=timeout) as response:
         payload = json.load(response)
     return payload["files"]
+
+
+def get_manifest(device: Device, bag_id: str, timeout: float = 30.0) -> dict[str, object]:
+    with urllib.request.urlopen(api_url(device, f"/v1/manifests/{bag_id}"), timeout=timeout) as response:
+        return json.load(response)
 
 
 def get_remote_hash(device: Device, file_id: str, timeout: float = 3600.0) -> str:
@@ -58,6 +63,7 @@ def download(
     total = int(item["size"])
     file_id = str(item["id"])
     part = destination.with_name(destination.name + ".part")
+    part.parent.mkdir(parents=True, exist_ok=True)
     offset = part.stat().st_size if part.exists() else 0
     if offset > total:
         raise ValueError(f"partial file is larger than remote file: {part}")
@@ -94,6 +100,7 @@ def download(
         if done != total:
             raise IOError(f"incomplete download: received {done} of {total} bytes")
     else:
+        part.touch(exist_ok=True)
         progress(total, total, 0)
     print(file=sys.stderr)
 
@@ -103,3 +110,65 @@ def download(
         return part, False
     part.replace(destination)
     return destination, True
+
+
+def download_rosbag(
+    device: Device,
+    item: dict[str, object],
+    destination: Path,
+    progress: Callable[[int, int, float], None] = default_progress,
+) -> Path:
+    manifest = get_manifest(device, str(item["id"]))
+    files = manifest.get("files")
+    if not isinstance(files, list) or not files:
+        raise ValueError("remote rosbag manifest is empty or invalid")
+    if manifest_sha256(files) != str(manifest.get("manifest_sha256", "")):
+        raise ValueError("remote rosbag manifest checksum is invalid")
+    if len({str(entry.get("path", "")) for entry in files}) != len(files):
+        raise ValueError("remote rosbag manifest contains duplicate paths")
+
+    total = sum(int(entry["size"]) for entry in files)
+    temporary = destination.with_name(f".{destination.name}.bagshare-part")
+    if temporary.exists() and not temporary.is_dir():
+        raise ValueError(f"temporary download path is not a directory: {temporary}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary.mkdir(parents=True, exist_ok=True)
+
+    completed = 0
+    count = len(files)
+    for index, entry in enumerate(files, 1):
+        relative = str(entry["path"])
+        target = safe_relative_destination(temporary, relative)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        size = int(entry["size"])
+        part = target.with_name(target.name + ".part")
+
+        if target.exists():
+            if not target.is_file():
+                raise ValueError(f"download target is not a file: {target}")
+            remote_hash = get_remote_hash(device, str(entry["id"]))
+            if target.stat().st_size == size and sha256_file(target) == remote_hash:
+                if part.exists():
+                    part.unlink()
+                completed += size
+                progress(completed, total, 0)
+                print(file=sys.stderr)
+                print(f"[{index}/{count}] {relative} (already verified)", file=sys.stderr)
+                continue
+            target.unlink()
+
+        print(f"[{index}/{count}] {relative}", file=sys.stderr)
+
+        def bag_progress(done: int, _file_total: int, speed: float, base: int = completed) -> None:
+            progress(base + done, total, speed)
+
+        path, verified = download(device, entry, target, progress=bag_progress)
+        if not verified:
+            raise IOError(f"SHA-256 verification failed; partial file kept at {path}")
+        completed += size
+
+    final_manifest = get_manifest(device, str(item["id"]))
+    if str(final_manifest.get("manifest_sha256", "")) != str(manifest["manifest_sha256"]):
+        raise IOError("source rosbag changed during transfer; temporary directory was kept")
+    temporary.replace(destination)
+    return destination
